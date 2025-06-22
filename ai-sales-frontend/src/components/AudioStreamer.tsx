@@ -37,6 +37,7 @@ export default function AudioStreamer({
 
       ws.onmessage = async (event) => {
         if (event.data instanceof Blob) {
+          console.log(`Received audio response: ${event.data.size} bytes`);
           const arrayBuffer = await event.data.arrayBuffer();
           const audioData = new Uint8Array(arrayBuffer);
           audioQueueRef.current.push(audioData);
@@ -120,9 +121,9 @@ export default function AudioStreamer({
       
       streamRef.current = stream;
       
-      // Setup audio analysis for visual feedback
+      // Setup audio context for raw PCM capture
       if (!audioContextRef.current) {
-        audioContextRef.current = new AudioContext();
+        audioContextRef.current = new AudioContext({ sampleRate: 16000 });
       }
       
       const source = audioContextRef.current.createMediaStreamSource(stream);
@@ -133,24 +134,38 @@ export default function AudioStreamer({
       // Start audio level monitoring
       monitorAudioLevel();
 
-      // Setup MediaRecorder for WebSocket streaming
-      const mediaRecorder = new MediaRecorder(stream, {
-        mimeType: 'audio/webm;codecs=opus'
-      });
-
-      mediaRecorder.ondataavailable = async (event) => {
-        if (event.data.size > 0 && wsRef.current?.readyState === WebSocket.OPEN) {
-          // Convert to PCM format expected by the server
-          const arrayBuffer = await event.data.arrayBuffer();
-          wsRef.current.send(arrayBuffer);
+      // Create ScriptProcessorNode for raw PCM data capture
+      const scriptProcessor = audioContextRef.current.createScriptProcessor(4096, 1, 1);
+      
+      scriptProcessor.onaudioprocess = (event) => {
+        if (wsRef.current?.readyState === WebSocket.OPEN) {
+          const inputBuffer = event.inputBuffer;
+          const inputData = inputBuffer.getChannelData(0); // Get mono channel
+          
+          // Convert float32 to int16 PCM
+          const pcmData = new Int16Array(inputData.length);
+          for (let i = 0; i < inputData.length; i++) {
+            // Convert from [-1, 1] to [-32768, 32767]
+            pcmData[i] = Math.max(-32768, Math.min(32767, inputData[i] * 32768));
+          }
+          
+          // Send raw PCM data
+          console.log(`Sending PCM audio chunk: ${pcmData.byteLength} bytes`);
+          wsRef.current.send(pcmData.buffer);
         }
       };
-
-      mediaRecorder.start(100); // Send data every 100ms
-      mediaRecorderRef.current = mediaRecorder;
+      
+      // Connect the audio processing chain
+      source.connect(scriptProcessor);
+      scriptProcessor.connect(audioContextRef.current.destination);
+      
+      // Store reference to disconnect later
+      (scriptProcessor as any).sourceNode = source;
+      mediaRecorderRef.current = scriptProcessor as any;
       
       setIsRecording(true);
-      setStatus('Recording...');
+      setStatus('Recording and streaming PCM...');
+      console.log('Started recording with Web Audio API (PCM)');
     } catch (error) {
       setStatus('Microphone access denied');
       console.error('Error starting recording:', error);
@@ -160,7 +175,12 @@ export default function AudioStreamer({
   // Stop recording
   const stopRecording = () => {
     if (mediaRecorderRef.current) {
-      mediaRecorderRef.current.stop();
+      // Disconnect ScriptProcessorNode
+      const scriptProcessor = mediaRecorderRef.current as any;
+      if (scriptProcessor.sourceNode) {
+        scriptProcessor.sourceNode.disconnect();
+      }
+      scriptProcessor.disconnect();
       mediaRecorderRef.current = null;
     }
     
