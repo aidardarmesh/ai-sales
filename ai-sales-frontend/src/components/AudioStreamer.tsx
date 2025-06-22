@@ -15,6 +15,7 @@ export default function AudioStreamer({
   const [isRecording, setIsRecording] = useState(false);
   const [status, setStatus] = useState('Ready');
   const [audioLevel, setAudioLevel] = useState(0);
+  const [isProcessing, setIsProcessing] = useState(false);
 
   const wsRef = useRef<WebSocket | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
@@ -38,6 +39,9 @@ export default function AudioStreamer({
       ws.onmessage = async (event) => {
         if (event.data instanceof Blob) {
           console.log(`Received audio response: ${event.data.size} bytes`);
+          setIsProcessing(false);
+          setStatus(isRecording ? 'Recording and streaming PCM...' : 'Connected');
+          
           const arrayBuffer = await event.data.arrayBuffer();
           const audioData = new Uint8Array(arrayBuffer);
           audioQueueRef.current.push(audioData);
@@ -152,6 +156,12 @@ export default function AudioStreamer({
           // Send raw PCM data
           console.log(`Sending PCM audio chunk: ${pcmData.byteLength} bytes`);
           wsRef.current.send(pcmData.buffer);
+          
+          // Update status to show we're waiting for processing
+          if (!isProcessing) {
+            setIsProcessing(true);
+            setStatus('Processing speech...');
+          }
         }
       };
       
@@ -251,6 +261,16 @@ export default function AudioStreamer({
         }`}></div>
       </div>
 
+      {/* Processing Status */}
+      {isProcessing && (
+        <div className="mb-4 p-3 rounded-lg bg-yellow-50 border border-yellow-200">
+          <div className="flex items-center">
+            <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-yellow-600 mr-2"></div>
+            <span className="text-sm text-yellow-700">AI is processing your speech...</span>
+          </div>
+        </div>
+      )}
+
       {/* Audio Level Indicator */}
       {isRecording && (
         <div className="mb-4">
@@ -306,14 +326,18 @@ export default function AudioStreamer({
 
       {/* Instructions */}
       <div className="mt-6 p-3 bg-blue-50 rounded-lg">
-        <h3 className="text-sm font-semibold text-blue-800 mb-2">Instructions:</h3>
+        <h3 className="text-sm font-semibold text-blue-800 mb-2">How it works:</h3>
         <ul className="text-xs text-blue-700 space-y-1">
-          <li>1. Click "Connect to Server" to establish WebSocket connection</li>
-          <li>2. Click "Start Recording" to begin audio streaming</li>
-          <li>3. Speak into your microphone</li>
-          <li>4. Listen for AI responses through your speakers</li>
-          <li>5. Click "Stop Recording" when done</li>
+          <li>1. Click "Connect to Server" to establish connection</li>
+          <li>2. Click "Start Recording" to begin audio capture</li>
+          <li>3. Speak naturally - the AI detects when you finish speaking</li>
+          <li>4. Wait for "Processing speech..." indicator</li>
+          <li>5. Listen for AI responses through your speakers</li>
+          <li>6. Continue the conversation naturally</li>
         </ul>
+        <div className="mt-2 p-2 bg-blue-100 rounded text-xs text-blue-600">
+          <strong>Tip:</strong> Pause for ~1 second after speaking to trigger AI processing
+        </div>
       </div>
     </div>
   );

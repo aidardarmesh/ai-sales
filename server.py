@@ -8,9 +8,9 @@ from google import genai
 from google.genai import types
 import os
 from dotenv import load_dotenv
-import time
+import numpy as np
 
-# Configure logging
+# Add after other imports
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -38,14 +38,68 @@ config = {
     "system_instruction": "You are a helpful AI sales assistant. Answer questions about products and services in a friendly, professional tone. Keep responses concise and engaging.",
 }
 
+class AudioBuffer:
+    def __init__(self, sample_rate=16000, silence_threshold=0.01, silence_duration=1.0):
+        self.sample_rate = sample_rate
+        self.silence_threshold = silence_threshold
+        self.silence_duration = silence_duration
+        self.buffer = []
+        self.silence_samples = 0
+        self.min_audio_length = sample_rate * 0.5  # Minimum 0.5 seconds
+        self.max_audio_length = sample_rate * 10   # Maximum 10 seconds
+        
+    def add_chunk(self, pcm_data: bytes) -> bytes:
+        """Add PCM chunk and return complete utterance when speech ends"""
+        # Convert bytes to numpy array (int16)
+        audio_samples = np.frombuffer(pcm_data, dtype=np.int16)
+        
+        # Calculate RMS (Root Mean Square) for volume detection
+        rms = np.sqrt(np.mean(audio_samples.astype(np.float32) ** 2)) / 32768.0
+        
+        # Add to buffer
+        self.buffer.extend(audio_samples)
+        
+        # Check if we're in silence
+        if rms < self.silence_threshold:
+            self.silence_samples += len(audio_samples)
+        else:
+            self.silence_samples = 0  # Reset silence counter on speech
+        
+        # Calculate silence duration
+        silence_duration = self.silence_samples / self.sample_rate
+        
+        # Check if we should send the buffer
+        should_send = False
+        
+        if len(self.buffer) >= self.max_audio_length:
+            # Send if buffer is too long
+            should_send = True
+            logger.info(f"Sending audio: max length reached ({len(self.buffer)} samples)")
+        elif (len(self.buffer) >= self.min_audio_length and 
+              silence_duration >= self.silence_duration):
+            # Send if we have enough audio and detected silence
+            should_send = True
+            logger.info(f"Sending audio: speech ended ({len(self.buffer)} samples, {silence_duration:.1f}s silence)")
+        
+        if should_send:
+            # Convert back to bytes and clear buffer
+            complete_audio = np.array(self.buffer, dtype=np.int16).tobytes()
+            self.buffer = []
+            self.silence_samples = 0
+            return complete_audio
+        
+        return b''  # No complete utterance yet
+
 class ConnectionManager:
     def __init__(self):
         self.active_connections: dict = {}
         self.gemini_sessions: dict = {}
+        self.audio_buffers: dict = {}
     
     async def connect(self, websocket: WebSocket, client_id: str):
         await websocket.accept()
         self.active_connections[client_id] = websocket
+        self.audio_buffers[client_id] = AudioBuffer()
         logger.info(f"Client {client_id} connected")
     
     def disconnect(self, client_id: str):
@@ -53,12 +107,17 @@ class ConnectionManager:
             del self.active_connections[client_id]
         if client_id in self.gemini_sessions:
             del self.gemini_sessions[client_id]
+        if client_id in self.audio_buffers:
+            del self.audio_buffers[client_id]
         logger.info(f"Client {client_id} disconnected")
     
     async def send_audio(self, client_id: str, data: bytes):
         if client_id in self.active_connections:
             websocket = self.active_connections[client_id]
             await websocket.send_bytes(data)
+    
+    def get_audio_buffer(self, client_id: str) -> AudioBuffer:
+        return self.audio_buffers.get(client_id)
     
     def set_gemini_session(self, client_id: str, session):
         self.gemini_sessions[client_id] = session
@@ -69,18 +128,26 @@ class ConnectionManager:
 manager = ConnectionManager()
 
 async def handle_client_audio(websocket: WebSocket, session, client_id: str):
-    """Receive PCM audio from frontend and send directly to Gemini"""
+    """Receive PCM audio chunks, buffer them, and send complete utterances to Gemini"""
+    audio_buffer = manager.get_audio_buffer(client_id)
+    
     try:
         while True:
-            # Receive PCM audio data from frontend
+            # Receive PCM audio chunk from frontend
             data = await websocket.receive_bytes()
-            logger.info(f"Received {len(data)} bytes PCM from client {client_id}")
+            logger.debug(f"Received {len(data)} bytes PCM chunk from client {client_id}")
             
-            # Send PCM data directly to Gemini Live API (no conversion needed!)
-            await session.send_realtime_input(
-                audio=types.Blob(data=data, mime_type="audio/pcm;rate=16000")
-            )
-            logger.info(f"Successfully sent {len(data)} bytes PCM to Gemini for client {client_id}")
+            # Add chunk to buffer and check if we have a complete utterance
+            complete_audio = audio_buffer.add_chunk(data)
+            
+            if complete_audio:
+                logger.info(f"Sending complete utterance to Gemini: {len(complete_audio)} bytes for client {client_id}")
+                
+                # Send complete utterance to Gemini Live API
+                await session.send_realtime_input(
+                    audio=types.Blob(data=complete_audio, mime_type="audio/pcm;rate=16000")
+                )
+                logger.info(f"Successfully sent complete utterance to Gemini for client {client_id}")
             
     except WebSocketDisconnect:
         logger.info(f"Client {client_id} disconnected during audio handling")
